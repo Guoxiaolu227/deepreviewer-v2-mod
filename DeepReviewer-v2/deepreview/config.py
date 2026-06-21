@@ -121,6 +121,25 @@ class Settings(BaseSettings):
         ),
     )
     meta_review_temperature: float = 0.2
+    # ---- Cost tracking ---------------------------------------------------
+    cost_tracking_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices(
+            "COST_TRACKING_ENABLED",
+            "TRACK_COST",
+        ),
+    )
+    pricing_config_path: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "PRICING_CONFIG_PATH",
+            "PRICING_CONFIG",
+            "COST_PRICING_PATH",
+        ),
+    )
+    # Per-call fixed costs (USD) for external services
+    mineru_fixed_cost_per_page: float = 0.0
+    mineru_fixed_cost_per_call: float = 0.0
     skip_pdf_export: bool = Field(
         default=False,
         validation_alias=AliasChoices(

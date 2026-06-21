@@ -27,6 +27,7 @@ from deepreview.report.source_annotations import build_source_annotations_for_ex
 from deepreview.state import ensure_artifact_paths, fail_job, load_job_state, mutate_job_state, set_status
 from deepreview.storage import append_event, read_json, write_json_atomic, write_text_atomic
 from deepreview.tools.review_tools import ReviewRuntimeContext, build_review_tools
+from deepreview.cost import CostTracker, load_pricing, merge_tracker_from_runs
 from deepreview.types import AnnotationItem, JobStatus
 
 
@@ -473,6 +474,15 @@ async def run_job_async(job_id: str) -> None:
     if job is None:
         raise FileNotFoundError(f'Job not found: {job_id}')
 
+    # ---- Cost tracking init ----
+    cost_tracker = None
+    if settings.cost_tracking_enabled:
+        pricing = load_pricing(
+            config_path=settings.pricing_config_path or None,
+            include_presets=True,
+        )
+        cost_tracker = CostTracker(pricing=pricing)
+
     api_mode = 'responses' if settings.openai_use_responses_api else 'chat_completions'
     append_event(
         job_id,
@@ -523,6 +533,12 @@ async def run_job_async(job_id: str) -> None:
         state.metadata['parse_warning'] = parse_result.warning
 
     mutate_job_state(job_id, apply_parsed)
+    if cost_tracker:
+        cost_tracker.record_phase(
+            "mineru_parse",
+            model=settings.mineru_model_version,
+            fixed_cost=settings.mineru_fixed_cost_per_call,
+        )
     if parse_result.warning:
         append_event(job_id, 'markdown_parse_warning', warning=parse_result.warning, provider=parse_result.provider)
 
@@ -563,6 +579,7 @@ async def run_job_async(job_id: str) -> None:
             settings=settings,
             artifacts=artifacts,
             source_pdf=source_pdf,
+            cost_tracker=cost_tracker,
         )
         return
     # ---- End branch (single-review path continues below) ----
@@ -858,6 +875,13 @@ async def run_job_async(job_id: str) -> None:
             'Final report gate was not satisfied.'
         )
 
+    if cost_tracker:
+        cost_tracker.record_from_token_usage(
+            phase="agent_review",
+            model=settings.agent_model,
+            token_usage=dict(usage_totals),
+        )
+
     set_status(job_id, JobStatus.pdf_exporting, 'Rendering final markdown report into PDF...')
 
     final_md_path = Path(artifacts['final_markdown'])
@@ -890,6 +914,11 @@ async def run_job_async(job_id: str) -> None:
         agent_model=str(settings.agent_model or '').strip(),
     )
 
+    if cost_tracker:
+        job_dir = Path(artifacts['source_pdf']).parent
+        cost_tracker.save_json(job_dir / "cost_breakdown.json")
+        cost_tracker.save_markdown(job_dir / "cost_breakdown.md")
+
     def apply_completed(state):
         state.status = JobStatus.completed
         state.message = 'Review pipeline completed.'
@@ -915,6 +944,7 @@ async def _run_parallel_pipeline(
     settings,
     artifacts: dict,
     source_pdf: Path,
+    cost_tracker = None,
 ) -> None:
     """Complete parallel review pipeline: N agent loops -> meta-review merge -> save."""
     from deepreview.meta_review import (
@@ -995,6 +1025,14 @@ async def _run_parallel_pipeline(
         total_annotations=sum(r.annotation_count for r in run_results),
     )
 
+    if cost_tracker:
+        merge_tracker_from_runs(
+            cost_tracker,
+            phase_prefix="agent",
+            run_results=run_results,
+            model=settings.agent_model,
+        )
+
     # Save individual reports
     for rr in run_results:
         if rr.report_markdown and not rr.report_markdown.startswith("[Run #"):
@@ -1059,6 +1097,14 @@ async def _run_parallel_pipeline(
         merge_tokens=meta.merge_token_usage.get("total_tokens", 0),
     )
 
+    if cost_tracker:
+        from deepreview.meta_review import _resolve_meta_review_model
+        cost_tracker.record_from_token_usage(
+            phase="meta_review_merge",
+            model=_resolve_meta_review_model(settings),
+            token_usage=meta.merge_token_usage,
+        )
+
     # PDF export (skip if configured, since we only need .md)
     final_md_path = Path(artifacts["final_markdown"])
     report_pdf_path = Path(artifacts["report_pdf"])
@@ -1084,6 +1130,10 @@ async def _run_parallel_pipeline(
             token_usage=token_usage_for_pdf,
             agent_model=str(settings.agent_model or "").strip(),
         )
+
+    if cost_tracker:
+        cost_tracker.save_json(job_dir / "cost_breakdown.json")
+        cost_tracker.save_markdown(job_dir / "cost_breakdown.md")
 
     def apply_completed(state):
         state.status = JobStatus.completed
