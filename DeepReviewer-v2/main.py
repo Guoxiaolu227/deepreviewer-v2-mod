@@ -13,6 +13,9 @@ from deepreview.config import get_settings
 from deepreview.runner import run_job
 from deepreview.state import ensure_artifact_paths, load_job_state, save_job_state
 from deepreview.storage import append_event, job_dir
+import asyncio
+from deepreview.experiment import compute_all_metrics, generate_experiment_report
+from deepreview.experiment.reporter import generate_charts, save_metrics_json
 from deepreview.types import JobState, JobStatus
 
 
@@ -252,6 +255,139 @@ def cmd_watch(args: argparse.Namespace) -> int:
         time.sleep(interval)
 
 
+def cmd_experiment(args: argparse.Namespace) -> int:
+    """Run full self-consistency experiment: baseline x2 + parallel x2 + iterative x2."""
+    from deepreview.config import Settings
+    from deepreview.runner import run_job_async
+
+    pdf_path = Path(args.pdf).expanduser().resolve()
+    if not pdf_path.exists():
+        print(f"ERROR: PDF not found: {pdf_path}")
+        return 2
+
+    title = args.title or pdf_path.stem
+    print(f"Experiment: {title}")
+    print(f"Model: {get_settings().agent_model}")
+    print("=" * 60)
+
+    # ---- Collect results ----
+    reports: dict[str, str] = {}
+    run_costs: dict[str, float] = {}
+    run_tokens: dict[str, dict[str, int]] = {}
+
+    strategies = [
+        ("baseline", {}),
+        ("baseline", {}),
+        ("parallel", {"ENABLE_META_REVIEW": "true", "NUM_PARALLEL_REVIEWS": "3"}),
+        ("parallel", {"ENABLE_META_REVIEW": "true", "NUM_PARALLEL_REVIEWS": "3"}),
+        ("iterative", {"ENABLE_ITERATIVE_REVIEW": "true", "ITERATIVE_ROUNDS": "3"}),
+        ("iterative", {"ENABLE_ITERATIVE_REVIEW": "true", "ITERATIVE_ROUNDS": "3"}),
+    ]
+
+    run_counter: dict[str, int] = {}
+    for strategy_name, env_overrides in strategies:
+        run_counter[strategy_name] = run_counter.get(strategy_name, 0) + 1
+        run_id = f"{strategy_name}_v{run_counter[strategy_name]}"
+        print(f"\n{'='*40}")
+        print(f"Running: {run_id}")
+        print(f"{'='*40}")
+
+        # Override env for this run
+        for k, v in env_overrides.items():
+            os.environ[k] = v
+
+        try:
+            # Force reload settings with new env
+            from deepreview.config import get_settings as _gs
+            _gs.cache_clear()
+            settings = _gs()
+
+            # Create job
+            job = _create_job(pdf_path, f"{title} [{run_id}]")
+            job_id = str(job.id)
+            print(f"  Job ID: {job_id}")
+
+            # Run synchronously via asyncio
+            from deepreview.cost import CostTracker, load_pricing
+            asyncio.run(run_job_async(job_id))
+
+            # Collect results
+            from deepreview.state import load_job_state as _ljs
+            final_job = _ljs(job_id)
+            if final_job and final_job.artifacts.final_markdown_path:
+                md_path = Path(final_job.artifacts.final_markdown_path)
+                if md_path.exists():
+                    reports[run_id] = md_path.read_text(encoding="utf-8")
+                    print(f"  Report: {len(reports[run_id])} chars")
+
+            # Collect cost
+            cost_path = Path(final_job.artifacts.source_pdf_path).parent / "cost_breakdown.json" if final_job and final_job.artifacts.source_pdf_path else None
+            if cost_path and cost_path.exists():
+                import json as _json
+                cost_data = _json.loads(cost_path.read_text(encoding="utf-8"))
+                run_costs[run_id] = cost_data.get("totals", {}).get("total_cost", 0)
+                run_tokens[run_id] = cost_data.get("totals", {})
+
+            print(f"  Done: {run_id}")
+
+        except Exception as exc:
+            print(f"  FAILED: {run_id} - {type(exc).__name__}: {exc}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # Clean env overrides
+            for k in env_overrides:
+                os.environ.pop(k, None)
+
+    # ---- Compute metrics ----
+    print(f"\n{'='*60}")
+    print("Computing metrics...")
+    print(f"Collected {len(reports)} reports")
+
+    if len(reports) < 2:
+        print("ERROR: Not enough successful runs to compute metrics")
+        return 2
+
+    metrics = compute_all_metrics(
+        reports=reports,
+        costs=run_costs,
+        token_usage=run_tokens,
+    )
+
+    # ---- Generate output ----
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    output_dir = Path("experiment_results") / timestamp
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save reports
+    for run_id, report_text in reports.items():
+        (output_dir / f"{run_id}.md").write_text(report_text, encoding="utf-8")
+
+    # Generate report
+    report_path = generate_experiment_report(
+        metrics,
+        output_dir=output_dir,
+        title=title,
+        paper_name=pdf_path.name,
+        model=get_settings().agent_model,
+    )
+    print(f"Report: {report_path}")
+
+    # Save JSON
+    json_path = save_metrics_json(metrics, output_dir)
+    print(f"Metrics JSON: {json_path}")
+
+    # Generate charts
+    charts = generate_charts(metrics, output_dir)
+    if charts:
+        print(f"Charts: {len(charts)} generated")
+    else:
+        print("Charts: matplotlib not available, skipping")
+
+    print(f"\n{'='*60}")
+    print(f"Experiment complete. Results: {output_dir}")
+    return 0
+
 def cmd_run_job(args: argparse.Namespace) -> int:
     run_job(str(args.job_id))
     return 0
@@ -293,6 +429,11 @@ def build_parser() -> argparse.ArgumentParser:
     watch.add_argument('--interval', type=float, default=2.0)
     watch.add_argument('--timeout', type=int, required=False)
     watch.set_defaults(func=cmd_watch)
+
+    experiment = sub.add_parser('experiment', help='Run self-consistency experiment')
+    experiment.add_argument('--pdf', required=True, help='Path to PDF file')
+    experiment.add_argument('--title', required=False, help='Experiment title')
+    experiment.set_defaults(func=cmd_experiment)
 
     run_job_cmd = sub.add_parser('_run-job', help=argparse.SUPPRESS)
     run_job_cmd.add_argument('--job-id', required=True)

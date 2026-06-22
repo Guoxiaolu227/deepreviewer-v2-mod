@@ -28,6 +28,11 @@ from deepreview.state import ensure_artifact_paths, fail_job, load_job_state, mu
 from deepreview.storage import append_event, read_json, write_json_atomic, write_text_atomic
 from deepreview.tools.review_tools import ReviewRuntimeContext, build_review_tools
 from deepreview.cost import CostTracker, load_pricing, merge_tracker_from_runs
+from deepreview.prompts.iterative_agent_prompt import (
+    _GAP_CHECK_SYSTEM,
+    build_gap_check_user_prompt,
+    build_iterative_round_prompt,
+)
 from deepreview.types import AnnotationItem, JobStatus
 
 
@@ -391,7 +396,8 @@ async def _run_single_agent_instance(
         if run_result is None and runtime.final_markdown_text:
             break
 
-        _consume(run_result, output_tag=f"attempt_{attempt}")
+        if run_result is not None:
+            _consume(run_result, output_tag=f"attempt_{attempt}")
 
         if runtime.final_markdown_text:
             break
@@ -565,6 +571,24 @@ async def run_job_async(job_id: str) -> None:
         state.metadata = metadata
 
     mutate_job_state(job_id, apply_paper_search_state)
+
+    # ---- Branch: iterative multi-round mode ----
+    num_rounds = max(2, min(4, int(settings.iterative_rounds)))
+    if settings.enable_iterative_review:
+        await _run_iterative_pipeline(
+            job_id=job_id,
+            job=job,
+            parse_result=parse_result,
+            page_index=page_index,
+            paper_adapter=paper_adapter,
+            paper_search_runtime_state=paper_search_runtime_state,
+            settings=settings,
+            artifacts=artifacts,
+            source_pdf=source_pdf,
+            cost_tracker=cost_tracker,
+        )
+        return
+    # ---- End iterative branch ----
 
     # ---- Branch: parallel multi-review mode ----
     num_parallel = max(1, min(8, int(settings.num_parallel_reviews)))
@@ -930,6 +954,280 @@ async def run_job_async(job_id: str) -> None:
 
     mutate_job_state(job_id, apply_completed)
     append_event(job_id, 'completed', report_pdf_path=str(report_pdf_path))
+
+
+
+
+# ---- Iterative multi-round pipeline ----------------------------------------
+
+async def _run_adversarial_gap_check(
+    *,
+    paper_markdown: str,
+    previous_report: str,
+    settings,
+) -> str:
+    """Run a single LLM completion to identify gaps in R1 report."""
+    from deepreview.meta_review import _build_meta_review_client, _resolve_meta_review_model
+
+    client = _build_meta_review_client(settings)
+    model = _resolve_meta_review_model(settings)
+    user_prompt = build_gap_check_user_prompt(
+        paper_markdown=paper_markdown,
+        previous_report=previous_report,
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=model,
+            temperature=0.3,
+            messages=[
+                {"role": "system", "content": _GAP_CHECK_SYSTEM},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+        return str(response.choices[0].message.content or "").strip()
+    except Exception as exc:
+        return f"(Gap check failed: {type(exc).__name__}: {exc})"
+
+
+async def _run_iterative_pipeline(
+    *,
+    job_id: str,
+    job,
+    parse_result,
+    page_index: dict,
+    paper_adapter,
+    paper_search_runtime_state: dict,
+    settings,
+    artifacts: dict,
+    source_pdf: Path,
+    cost_tracker = None,
+) -> None:
+    """Iterative 3-round review: R1 discover -> R2 deepen -> R3 synthesize."""
+    from deepreview.report.final_report import find_missing_required_sections
+
+    rounds = max(2, min(4, int(settings.iterative_rounds)))
+    append_event(job_id, "iterative_review_starting", rounds=rounds)
+    job_dir = Path(artifacts["source_pdf"]).parent
+
+    iterative_model = str(settings.iterative_model or settings.agent_model or "").strip()
+
+    # Shared config
+    run_config = _build_run_config()
+    agent_model = _build_agent_model()
+    source_markdown = parse_result.markdown
+
+    # ---- R1: DISCOVER ----
+    set_status(job_id, JobStatus.agent_running,
+               f"Iterative Round 1/{rounds}: DISCOVER phase...")
+    r1_prompt = build_iterative_round_prompt(
+        round_number=1,
+        base_paper_markdown=source_markdown,
+        source_file_id=job_id,
+        source_file_name=job.source_pdf_name,
+        ui_language=settings.ui_language,
+        paper_search_runtime_state=paper_search_runtime_state,
+    )
+    write_text_atomic(job_dir / "agent_prompt_r1.txt", r1_prompt)
+
+    r1_runtime = ReviewRuntimeContext(
+        job_id=job_id, job_dir=job_dir, page_index=page_index,
+        source_markdown=source_markdown, paper_adapter=paper_adapter,
+        paper_search_runtime_state=dict(paper_search_runtime_state),
+        settings=settings,
+    )
+    r1_tools = build_review_tools(r1_runtime)
+    r1_agent = Agent(
+        name="DeepReviewer2Agent-IterR1",
+        instructions=r1_prompt, tools=r1_tools,
+        model=agent_model, model_settings=_build_agent_model_settings(),
+    )
+    r1_result = await _run_single_agent_instance(
+        job_id=job_id, run_index=0, agent=r1_agent,
+        run_config=run_config, runtime=r1_runtime,
+        tools=r1_tools, prompt=r1_prompt, settings=settings,
+    )
+    r1_report = r1_result.report_markdown or ""
+    if not r1_report.strip():
+        r1_report = f"[Round 1 produced no report. Annotations: {r1_result.annotation_count}]"
+
+    write_text_atomic(job_dir / "final_report_r1.md", r1_report)
+    if cost_tracker:
+        cost_tracker.record_from_token_usage(
+            "iter_round_1", model=iterative_model,
+            token_usage=r1_result.token_usage,
+        )
+
+    append_event(job_id, "iterative_r1_complete",
+                 annotation_count=r1_result.annotation_count,
+                 report_chars=len(r1_report),
+                 tokens=r1_result.token_usage.get("total_tokens", 0))
+
+    # ---- Adversarial gap check ----
+    set_status(job_id, JobStatus.agent_running,
+               f"Iterative: running adversarial gap check...")
+    gap_text = await _run_adversarial_gap_check(
+        paper_markdown=source_markdown,
+        previous_report=r1_report,
+        settings=settings,
+    )
+    append_event(job_id, "iterative_gap_check_done", gap_chars=len(gap_text))
+
+    # ---- R2: DEEPEN ----
+    set_status(job_id, JobStatus.agent_running,
+               f"Iterative Round 2/{rounds}: DEEPEN phase...")
+    missing = find_missing_required_sections(r1_report)
+    r2_prompt = build_iterative_round_prompt(
+        round_number=2,
+        base_paper_markdown=source_markdown,
+        previous_report=r1_report,
+        adversarial_gaps=gap_text,
+        missing_sections=missing,
+        source_file_id=job_id,
+        source_file_name=job.source_pdf_name,
+        ui_language=settings.ui_language,
+        paper_search_runtime_state=paper_search_runtime_state,
+    )
+    write_text_atomic(job_dir / "agent_prompt_r2.txt", r2_prompt)
+
+    r2_runtime = ReviewRuntimeContext(
+        job_id=job_id, job_dir=job_dir, page_index=page_index,
+        source_markdown=source_markdown, paper_adapter=paper_adapter,
+        paper_search_runtime_state=dict(paper_search_runtime_state),
+        settings=settings,
+    )
+    r2_tools = build_review_tools(r2_runtime)
+    r2_agent = Agent(
+        name="DeepReviewer2Agent-IterR2",
+        instructions=r2_prompt, tools=r2_tools,
+        model=agent_model, model_settings=_build_agent_model_settings(),
+    )
+    r2_result = await _run_single_agent_instance(
+        job_id=job_id, run_index=1, agent=r2_agent,
+        run_config=run_config, runtime=r2_runtime,
+        tools=r2_tools, prompt=r2_prompt, settings=settings,
+    )
+    r2_report = r2_result.report_markdown or r1_report
+
+    write_text_atomic(job_dir / "final_report_r2.md", r2_report)
+    if cost_tracker:
+        cost_tracker.record_from_token_usage(
+            "iter_round_2", model=iterative_model,
+            token_usage=r2_result.token_usage,
+        )
+
+    append_event(job_id, "iterative_r2_complete",
+                 annotation_count=r2_result.annotation_count,
+                 report_chars=len(r2_report),
+                 tokens=r2_result.token_usage.get("total_tokens", 0))
+
+    # ---- R3: SYNTHESIS (tool-limited) ----
+    set_status(job_id, JobStatus.agent_running,
+               f"Iterative Round 3/{rounds}: SYNTHESIS phase...")
+    r3_prompt = build_iterative_round_prompt(
+        round_number=3,
+        base_paper_markdown=source_markdown,
+        previous_report=r2_report,
+        source_file_id=job_id,
+        source_file_name=job.source_pdf_name,
+        ui_language=settings.ui_language,
+        paper_search_runtime_state=paper_search_runtime_state,
+    )
+    write_text_atomic(job_dir / "agent_prompt_r3.txt", r3_prompt)
+
+    r3_runtime = ReviewRuntimeContext(
+        job_id=job_id, job_dir=job_dir, page_index=page_index,
+        source_markdown=source_markdown, paper_adapter=paper_adapter,
+        paper_search_runtime_state=dict(paper_search_runtime_state),
+        settings=settings,
+    )
+    r3_all_tools = build_review_tools(r3_runtime)
+    r3_tools = [t for t in r3_all_tools if t.name == "review_final_markdown_write"]
+    r3_agent = Agent(
+        name="DeepReviewer2Agent-IterR3",
+        instructions=r3_prompt, tools=r3_tools,
+        model=agent_model, model_settings=_build_agent_model_settings(),
+    )
+    r3_result = await _run_single_agent_instance(
+        job_id=job_id, run_index=2, agent=r3_agent,
+        run_config=run_config, runtime=r3_runtime,
+        tools=r3_tools, prompt=r3_prompt, settings=settings,
+    )
+    r3_report = r3_result.report_markdown or r2_report
+
+    write_text_atomic(job_dir / "final_report_r3.md", r3_report)
+    # Write final report
+    write_text_atomic(Path(artifacts["final_markdown"]), r3_report)
+    if cost_tracker:
+        cost_tracker.record_from_token_usage(
+            "iter_round_3", model=iterative_model,
+            token_usage=r3_result.token_usage,
+        )
+
+    append_event(job_id, "iterative_r3_complete",
+                 annotation_count=r3_result.annotation_count,
+                 report_chars=len(r3_report),
+                 tokens=r3_result.token_usage.get("total_tokens", 0))
+
+    # ---- PDF export ----
+    final_md_path = Path(artifacts["final_markdown"])
+    report_pdf_path = Path(artifacts["report_pdf"])
+    skip_pdf = bool(settings.skip_pdf_export)
+
+    total_requests = (r1_result.token_usage.get("requests", 0) +
+                      r2_result.token_usage.get("requests", 0) +
+                      r3_result.token_usage.get("requests", 0))
+    total_input = (r1_result.token_usage.get("input_tokens", 0) +
+                   r2_result.token_usage.get("input_tokens", 0) +
+                   r3_result.token_usage.get("input_tokens", 0))
+    total_output = (r1_result.token_usage.get("output_tokens", 0) +
+                    r2_result.token_usage.get("output_tokens", 0) +
+                    r3_result.token_usage.get("output_tokens", 0))
+
+    if not skip_pdf:
+        set_status(job_id, JobStatus.pdf_exporting,
+                   "Rendering final markdown report into PDF...")
+        token_usage_for_pdf = {
+            "requests": total_requests,
+            "input_tokens": total_input,
+            "output_tokens": total_output,
+            "total_tokens": total_input + total_output,
+        }
+        _render_report_pdf(
+            job_id=job_id, job_title=job.title,
+            source_pdf_name=job.source_pdf_name,
+            final_md_path=final_md_path, source_pdf_path=source_pdf,
+            report_pdf_path=report_pdf_path, annotations=[],
+            content_list=parse_result.content_list,
+            token_usage=token_usage_for_pdf,
+            agent_model=str(settings.agent_model or "").strip(),
+        )
+
+    if cost_tracker:
+        cost_tracker.save_json(job_dir / "cost_breakdown.json")
+        cost_tracker.save_markdown(job_dir / "cost_breakdown.md")
+
+    def apply_comp(state):
+        state.status = JobStatus.completed
+        state.message = (
+            f"Review pipeline completed ({rounds}-round iterative)."
+        )
+        state.error = None
+        state.final_report_ready = True
+        state.pdf_ready = report_pdf_path.exists() if not skip_pdf else False
+        state.artifacts.final_markdown_path = str(final_md_path)
+        if not skip_pdf:
+            state.artifacts.report_pdf_path = str(report_pdf_path)
+        state.usage.token.requests = total_requests
+        state.usage.token.input_tokens = total_input
+        state.usage.token.output_tokens = total_output
+        state.usage.token.total_tokens = total_input + total_output
+        meta = dict(state.metadata)
+        meta["review_strategy"] = "iterative"
+        meta["iterative_rounds"] = rounds
+        state.metadata = meta
+
+    mutate_job_state(job_id, apply_comp)
+    append_event(job_id, "completed", strategy="iterative", rounds=rounds)
 
 
 

@@ -140,6 +140,26 @@ class Settings(BaseSettings):
     # Per-call fixed costs (USD) for external services
     mineru_fixed_cost_per_page: float = 0.0
     mineru_fixed_cost_per_call: float = 0.0
+    # ---- Iterative multi-round review ----------------------------------
+    enable_iterative_review: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "ENABLE_ITERATIVE_REVIEW",
+            "ITERATIVE_REVIEW",
+        ),
+    )
+    iterative_rounds: int = Field(
+        default=3,
+        validation_alias=AliasChoices(
+            "ITERATIVE_ROUNDS",
+        ),
+    )
+    iterative_model: str = Field(
+        default="",
+        validation_alias=AliasChoices(
+            "ITERATIVE_MODEL",
+        ),
+    )
     skip_pdf_export: bool = Field(
         default=False,
         validation_alias=AliasChoices(
